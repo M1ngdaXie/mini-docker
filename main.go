@@ -6,8 +6,36 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 )
+
+// ——— bridge ———
+
+const bridgeName = "mdbr0"
+const bridgeIP = "10.100.0.1"
+const bridgeSubnet = "10.100.0.0/24"
+
+func ensureBridge() {
+	if _, err := os.Stat("/sys/class/net/" + bridgeName); err == nil {
+		return
+	}
+	runCmd("ip", "link", "add", bridgeName, "type", "bridge")
+	runCmd("ip", "addr", "add", bridgeIP+"/24", "dev", bridgeName)
+	runCmd("ip", "link", "set", bridgeName, "up")
+	fmt.Printf("[bridge] %s created at %s\n", bridgeName, bridgeIP)
+}
+
+func allocateIP() string {
+	data, _ := os.ReadFile("/tmp/mdbr0-ip-last")
+	last := 1
+	if len(data) > 0 {
+		last, _ = strconv.Atoi(string(data))
+	}
+	next := last + 1
+	os.WriteFile("/tmp/mdbr0-ip-last", []byte(strconv.Itoa(next)), 0644)
+	return fmt.Sprintf("10.100.0.%d", next)
+}
 
 // 这个 demo 没有加 CLONE_NEWUSER(user namespace)。
 // 加了之后容器里的"root"会映射成宿主机上一个无权限的普通用户,
@@ -34,11 +62,43 @@ func main() {
 func run() {
 	args := os.Args[2:]
 	if len(args) == 0 {
-		args = []string{"/bin/sh"}
+		fmt.Fprintf(os.Stderr, "Usage: %s run <image>[:tag] [command...]\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	// 解析 "alpine" 或 "python:3.11"
+	image := args[0]
+	tag := "latest"
+	if idx := strings.Index(image, ":"); idx != -1 {
+		tag = image[idx+1:]
+		image = image[:idx]
+	}
+	cmdArgs := args[1:]
+
+	// --no-entry: 跳过镜像的 entrypoint，直接跑用户命令
+	skipEntrypoint := false
+	if len(cmdArgs) > 0 && cmdArgs[0] == "--no-entry" {
+		skipEntrypoint = true
+		cmdArgs = cmdArgs[1:]
+	}
+
+	result, err := pullImage(image, tag)
+	must(err)
+
+	// 用户没指定命令，用镜像默认的
+	if len(cmdArgs) == 0 {
+		cmdArgs = result.Cmd
+		if len(cmdArgs) == 0 {
+			cmdArgs = []string{"/bin/sh"}
+		}
+	}
+	// 镜像有 entrypoint 且不跳过，就排在命令前面
+	if !skipEntrypoint {
+		cmdArgs = append(result.Entrypoint, cmdArgs...)
 	}
 
 	hostPID := os.Getpid()
-	fmt.Printf("[run]   Running %v as PID %d\n", args, hostPID)
+	fmt.Printf("[run]   %s:%s → %v as PID %d\n", image, tag, cmdArgs, hostPID)
 
 	overlayBase := fmt.Sprintf("/tmp/maingo-%d", hostPID)
 	upperDir := overlayBase + "/upper"
@@ -48,50 +108,52 @@ func run() {
 	vethCtr := fmt.Sprintf("veth1-%d", hostPID)
 	cgroupName := fmt.Sprintf("maingo-%d", hostPID)
 
-	ipSuffix := hostPID % 253
-	hostIP := fmt.Sprintf("10.0.%d.1", ipSuffix)
-	ctrIP := fmt.Sprintf("10.0.%d.2", ipSuffix)
-	subnet := fmt.Sprintf("10.0.%d.0/24", ipSuffix)
+	ctrIP := allocateIP()
 
 	must(os.MkdirAll(upperDir, 0755))
 	must(os.MkdirAll(workDir, 0755))
 	must(os.MkdirAll(mergedDir, 0755))
 
-	// 用 defer 而不是"cmd.Wait() 之后顺序执行"：
-	// must(cmd.Wait()) 在子进程非 0 退出时会 panic,
-	// 之前的写法一旦这里 panic，后面的清理代码一行都不会跑，
-	// 会在宿主机上留下孤儿 veth / iptables 规则 / cgroup / 临时目录。
-	// defer 保证不管中间从哪里 panic，清理都会按 LIFO 顺序跑完。
 	defer safeRemoveAll(overlayBase)
 	defer cleanupCgroup(cgroupName)
 	defer cleanupVeth(vethHost)
-	defer cleanupNAT(subnet)
 
 	r, w, err := os.Pipe()
 	must(err)
 
-	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, args...)...)
+	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, cmdArgs...)...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.ExtraFiles = []*os.File{r}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS |
+		Cloneflags: syscall.CLONE_NEWUSER |
+			syscall.CLONE_NEWUTS |
 			syscall.CLONE_NEWPID |
 			syscall.CLONE_NEWNS |
 			syscall.CLONE_NEWNET,
 	}
-	cmd.Env = append(os.Environ(),
+	cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
+		{ContainerID: 0, HostID: 0, Size: 65536},
+	}
+	cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
+		{ContainerID: 0, HostID: 0, Size: 65536},
+	}
+	// 先加镜像的环境变量，再拼我们自己的——镜像的 Env 可能覆盖宿主机的
+	cmd.Env = append(os.Environ(), result.Env...)
+	cmd.Env = append(cmd.Env,
 		"MAINGO_MERGED="+mergedDir,
 		"MAINGO_UPPER="+upperDir,
 		"MAINGO_WORK="+workDir,
+		"MAINGO_LOWER="+result.LowerDirs,
 		"MAINGO_CGROUP="+cgroupName)
 
 	must(cmd.Start())
 	r.Close()
 
-	setupVeth(cmd.Process.Pid, vethHost, vethCtr, hostIP, ctrIP, subnet)
-	setupNAT(cmd.Process.Pid, ctrIP, subnet)
+	ensureBridge()
+	setupVeth(cmd.Process.Pid, vethHost, vethCtr, ctrIP)
+	setupNAT()
 
 	w.Write([]byte{1})
 	w.Close()
@@ -120,7 +182,7 @@ func child() {
 	upperDir := os.Getenv("MAINGO_UPPER")
 	workDir := os.Getenv("MAINGO_WORK")
 
-	lowerDir := "/home/mingdax/alpine-rootfs"
+	lowerDir := os.Getenv("MAINGO_LOWER")
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lowerDir, upperDir, workDir)
 	must(syscall.Mount("overlay", mergedDir, "overlay", 0, opts))
 	fmt.Printf("[overlay] mounted\n")
@@ -140,7 +202,7 @@ func child() {
 	must(syscall.Unmount("proc", 0))
 }
 
-func setupVeth(childPID int, vethHost, vethCtr, hostIP, ctrIP, subnet string) {
+func setupVeth(childPID int, vethHost, vethCtr, ctrIP string) {
 	pid := strconv.Itoa(childPID)
 
 	runCmdSilent("ip", "link", "del", vethHost)
@@ -148,35 +210,33 @@ func setupVeth(childPID int, vethHost, vethCtr, hostIP, ctrIP, subnet string) {
 	runCmd("ip", "link", "add", vethHost, "type", "veth", "peer", "name", vethCtr)
 	runCmd("ip", "link", "set", vethCtr, "netns", pid)
 
-	runCmd("ip", "addr", "add", hostIP+"/24", "dev", vethHost)
+	// 宿主端插进网桥，不配 IP——bridge 自己有一个 IP 当网关
+	runCmd("ip", "link", "set", vethHost, "master", bridgeName)
 	runCmd("ip", "link", "set", vethHost, "up")
 
+	// 容器端：配 IP、设默认网关、启 lo
 	runCmd("nsenter", "-t", pid, "-n", "ip", "addr", "add", ctrIP+"/24", "dev", vethCtr)
 	runCmd("nsenter", "-t", pid, "-n", "ip", "link", "set", vethCtr, "up")
 	runCmd("nsenter", "-t", pid, "-n", "ip", "link", "set", "lo", "up")
+	runCmd("nsenter", "-t", pid, "-n", "ip", "route", "add", "default", "via", bridgeIP)
 
-	fmt.Printf("[veth]  pair ready: host=%s, container=%s\n", hostIP, ctrIP)
+	fmt.Printf("[veth]  %s → %s via %s\n", ctrIP, bridgeName, bridgeIP)
 }
 
-func setupNAT(childPID int, ctrIP, subnet string) {
-	pid := strconv.Itoa(childPID)
-
+// setupNAT 确保共享子网能出公网。规则只加一次，多个容器复用。
+func setupNAT() {
 	must(os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644))
-	runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE")
-	runCmd("nsenter", "-t", pid, "-n", "ip", "route", "add", "default", "via",
-		ctrIP[:len(ctrIP)-1]+"1")
 
-	fmt.Printf("[nat]   NAT enabled: %s → internet\n", subnet)
+	if _, err := os.Stat("/tmp/mdbr0-nat-ready"); err == nil {
+		return
+	}
+	runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", bridgeSubnet, "-j", "MASQUERADE")
+	os.WriteFile("/tmp/mdbr0-nat-ready", []byte("1"), 0644)
+	fmt.Printf("[nat]   MASQUERADE %s → internet\n", bridgeSubnet)
 }
 
 func cleanupVeth(vethHost string) {
 	runCmdSilent("ip", "link", "del", vethHost)
-}
-
-func cleanupNAT(subnet string) {
-	runCmdSilent("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j",
-		"MASQUERADE")
-	fmt.Printf("[nat]   cleaned up\n")
 }
 
 func waitForNetwork() {
